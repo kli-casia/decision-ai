@@ -1,0 +1,16 @@
+services:
+  - name: learner
+    path: 'learner.py'
+    num: 1
+    kwargs:
+
+  - name: actor
+    path: 'actor.py'
+    num: 1
+
+envs:
+  - name: env
+    path: 'env.py'
+    num: 1
+
+log_dir: './log'

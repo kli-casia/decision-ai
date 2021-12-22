@@ -1,0 +1,227 @@
+#!/usr/bin/env python
+from msagent.core.router import route_event_msg, route_service_msg
+from msagent.utils.service_utils import GetLocalIP, GetPlasmaDir
+from msagent import config, Worker, logger
+
+from multiprocessing import Process
+import subprocess
+import argparse
+import inspect
+import shutil
+import signal
+import yaml
+import importlib
+import sys
+import os
+
+
+def get_logfile(service, log_dir, ind=None):
+    if ind is not None:
+        return os.path.join(log_dir, "{}_{}.log".format(service, ind))
+    else:
+        return os.path.join(log_dir, "{}.log".format(service))
+
+
+def run_cmd(cmd, logfile):
+    with open(logfile, "w+") as f:
+        p = subprocess.Popen(cmd, stderr=f, stdout=f, start_new_session=True)
+        return p
+
+
+def parse_service_path(service_name, service_path):
+
+    def is_worker(service_class):
+        if inspect.isclass(service_class) and issubclass(service_class, Worker):
+            return True
+        else:
+            return False
+    service_module = importlib.import_module(service_name, service_path)
+    classes = [cls[0] for cls in inspect.getmembers(
+        service_module, is_worker) if not cls[0] == 'Worker']
+    assert not len(classes) == 0, 'service class not found'
+    assert not len(
+        classes) > 1, 'service module contain multiple workers: {}'.format(classes)
+    service_class = classes[0]
+    return getattr(service_module, service_class)
+
+
+def run_service(service_path, service_name, service_id, kwargs):
+    logger.set_logfile('log/{}_{}.log'.format(service_name, service_id))
+    logger.set_prefix('{}_{}'.format(service_name, service_id))
+    assert os.path.exists(service_path)
+    service_dir = os.path.dirname(service_path)
+    sys.path.append(service_dir)
+    service_class = parse_service_path(service_name, service_path)
+    service_class.service_name = service_name
+    service_class.worker_id = service_id
+    service_instance = service_class(**kwargs)
+    try:
+        service_instance.run()
+    except Exception as e:
+        logger.error('{}, {}'.format(type(e), e))
+
+
+def clean_subprocess(processes, tmpdir):
+    logger.debug("try to clean subprocess")
+    for p in processes:
+        if p.stdin:
+            p.stdin.close()
+        if p.stdout:
+            p.stdout.close()
+        if p.stderr:
+            p.stderr.close()
+
+        try:
+            p.kill()
+        except OSError as e:
+            logger.error("clean subprocess fail: {}".format(e))
+
+    logger.debug("try to remove tmp directory")
+    shutil.rmtree(tmpdir)
+    logger.info("msagent exit")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--config", "-c", type=str, default="./example.yaml", help="specify config dir"
+    )
+    args = parser.parse_args()
+
+    config_file = args.config
+    assert config_file.endswith('.yaml'), 'config must be yaml file'
+    with open(config_file, 'r', encoding="utf-8") as f:
+        conf = yaml.load(f, Loader=yaml.FullLoader)
+
+    os.environ['msagent_CONFIG'] = str(conf)
+    config.update(conf)
+
+    logdir = config.LOG_DIR
+    if not os.path.exists(logdir):
+        os.makedirs(logdir)
+        logger.debug("make logdir {}".format(logdir))
+
+    tmpdir = config.DEFAULT_TMP_DIR
+    if not os.path.exists(tmpdir):
+        os.mkdir(tmpdir)
+        logger.debug("make tmpdir {}".format(tmpdir))
+
+    processes = []
+    # if is disributed mode, start consul agent
+    if config.IS_DISTRIBUTED:
+        if config.IS_HEAD:
+            cmd = (
+                "consul agent -server -data-dir={} -bootstrap-expect=1 -bind={}".format(
+                    tmpdir, GetLocalIP()
+                )
+            )
+        else:
+            head_addr = config.HEAD_ADDRESS
+            assert head_addr is not None
+            cmd = "consul agent -data-dir={} -bind={} -join={}".format(
+                tmpdir, GetLocalIP(), head_addr
+            )
+        logfile = get_logfile("consul", logdir)
+        proc = run_cmd(cmd.split(), logfile)
+        processes.append(proc)
+    
+    # start redis
+    cmd = ('redis-server')
+    logfile = get_logfile("redis", logdir)
+    proc = run_cmd(cmd.split(), logfile)
+    processes.append(proc)
+
+    # start plasma store if needed
+    if config.USE_PLASMA:
+        capacity = config.PLASMA_CAPACITY
+        cmd = [
+            "plasma_store",
+            "-m",
+            str(int(capacity * 1000000000)),
+            "-s",
+            GetPlasmaDir(),
+        ]
+        logfile = get_logfile("plasma", logdir)
+        proc = run_cmd(cmd, logfile)
+        processes.append(proc)
+
+    # start services
+    assert 'services' in conf and isinstance(
+        conf['services'], list), 'yaml format error'
+    service_confs = conf.get('services')
+    service_names = [conf['name'] for conf in service_confs]
+    assert len(service_names) == len(set(service_names)), 'redefined service, '
+
+    for service_conf in service_confs:
+        try:
+            assert isinstance(service_conf, dict)
+            path = service_conf['path']
+            name = service_conf['name']
+            num = service_conf['num']
+            kwargs = service_conf.get('kwargs')
+            if kwargs is None:
+                kwargs = {}
+        except:
+            raise RuntimeError('yaml format error')
+
+        for i in range(num):
+            p = Process(target=run_service, args=(
+                path, name, i, kwargs), daemon=True)
+            p.start()
+
+    # start router
+    def _route_event_msg(service_names):
+        logger.set_logfile('log/event_router.log')
+        logger.set_prefix('event_router')
+        try:
+            route_event_msg(service_names)
+        except Exception as e:
+            logger.error(e)
+            raise RuntimeError('router event error: {}'.format(e))
+
+    p = Process(
+        target=_route_event_msg, args=(service_names,), daemon=True)
+    p.start()
+
+    def _route_service_msg(service_names, l):
+        logger.set_logfile('log/service_router.log')
+        logger.set_prefix('service_router')
+        try:
+            route_service_msg(service_names, l)
+        except Exception as e:
+            logger.error(e)
+            raise RuntimeError('router service error: {}'.format(e))
+
+    p = Process(
+        target=_route_service_msg, args=(service_names, 10), daemon=True
+    )
+    p.start()
+
+    # start env
+    if 'envs' in conf:
+        env_confs = conf['envs']
+        assert isinstance(env_confs, list)
+        for env_conf in env_confs:
+            try:
+                name = env_conf['name']
+                path = env_conf['path']
+                num = env_conf['num']
+            except:
+                raise RuntimeError('yaml format error')
+            for i in range(num):
+                cmd = "python -u {}".format(path).split()
+                logfile = get_logfile('env', logdir, i)
+                proc = run_cmd(cmd, logfile)
+                processes.append(proc)
+
+    # register exit callback
+
+    def signal_cb(sig_num, frame):
+        clean_subprocess(processes, tmpdir)
+        exit()
+
+    for sig in [signal.SIGINT, signal.SIGHUP, signal.SIGTERM]:
+        signal.signal(sig, signal_cb)
+
+    while True:
+        pass

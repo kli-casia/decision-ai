@@ -1,0 +1,15 @@
+services:
+  - name: learner
+    path: 'learner.py'
+    num: 1
+
+  - name: actor
+    path: 'actor.py'
+    num: 1
+
+envs:
+  - name: env
+    path: 'env.py'
+    num: 2
+
+log_dir: './log'
