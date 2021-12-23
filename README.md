@@ -1,4 +1,4 @@
-# msagent
+# MSAgent
 
 MSAgent 是一套基于微服务架构的分布式强化学习框架
 ## Get Started
